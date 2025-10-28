@@ -1,0 +1,224 @@
+// ==UserScript==
+// @name         Kite Positions — Order Value Column & Highlighter (Robust)
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  Robust injection: waits for the positions table, logs steps, adds Order Value column & highlights rows above limit for MTF/CNC on kite positions page.
+// @match        *://kite.zerodha.com/*positions*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+  'use strict';
+  console.log('TM: positions script loaded');
+
+  /***** CONFIG *****/
+  const LIMIT = 250000;                // ₹ threshold to highlight
+  const PRODUCTS_TO_SHOW = ['MTF','CNC']; // products to calculate for (case-insensitive)
+  const HIGHLIGHT_STYLE = 'background: rgba(255, 230, 230, 0.95) !important;'; // highlight row CSS
+  const CELL_TEXT_COLOR = '#b00';      // color for value when over limit
+  const REFRESH_INTERVAL_MS = 1200;    // periodic refresh
+  const MAX_WAIT_FOR_TABLE_MS = 30000; // wait up to 30s for table to appear
+  /******************/
+
+  function log(...args) { console.log('TM:', ...args); }
+
+  function formatINR(n) {
+    if (isNaN(n) || !isFinite(n) || n===0) return '-';
+    return '₹' + Number(n).toLocaleString('en-IN', {maximumFractionDigits:2});
+  }
+
+  // attempt a variety of strategies to find the positions table and header
+  function findPositionsTable() {
+    // preferred: table that contains header cells with Product, Qty, LTP
+    const tables = Array.from(document.querySelectorAll('table'));
+    let best = null;
+    for (const t of tables) {
+      try {
+        const headers = Array.from(t.querySelectorAll('thead th')).map(h => (h.innerText||'').trim().toLowerCase());
+        if (!headers.length) continue;
+        const hasProduct = headers.some(h => /product/i.test(h));
+        const hasQty = headers.some(h => /qty|quantity/i.test(h));
+        const hasLtp = headers.some(h => /ltp|last/i.test(h));
+        if (hasProduct && hasQty && hasLtp) {
+          log('Found positions table by header match');
+          return {
+            table: t,
+            thead: t.querySelector('thead'),
+            tbody: t.querySelector('tbody'),
+            headerThs: headers,
+            qtyIndex: headers.findIndex(h => /qty|quantity/i.test(h)),
+            ltpIndex: headers.findIndex(h => /ltp|last/i.test(h)),
+            productIndex: headers.findIndex(h => /product/i.test(h))
+          };
+        }
+        // keep fallback
+        if (!best && (hasQty || hasLtp || hasProduct)) best = {table: t, thead: t.querySelector('thead'), tbody: t.querySelector('tbody'), headerThs: headers};
+      } catch(e) {
+        // ignore row parse errors
+      }
+    }
+
+    // fallback: try to locate a container that includes the text "Positions" and has a table inside
+    if (!best) {
+      const nodes = Array.from(document.querySelectorAll('div, section, main'));
+      for (const n of nodes) {
+        if ((n.innerText||'').toLowerCase().includes('positions') && n.querySelector('table')) {
+          const t = n.querySelector('table');
+          const headers = Array.from(t.querySelectorAll('thead th')).map(h => (h.innerText||'').trim().toLowerCase());
+          log('Found table via "Positions" container fallback');
+          return {table: t, thead: t.querySelector('thead'), tbody: t.querySelector('tbody'), headerThs: headers};
+        }
+      }
+    }
+
+    if (best) {
+      log('Using best-effort table guess (partial header match).');
+      return best;
+    }
+    return null;
+  }
+
+  // create header cell
+  function ensureHeader(info) {
+    if (!info || !info.thead) return;
+    const existing = Array.from(info.thead.querySelectorAll('th')).some(th => (th.innerText||'').toLowerCase().includes('order value'));
+    if (existing) return;
+    const tr = info.thead.querySelector('tr') || info.thead;
+    if (!tr) return;
+    const th = document.createElement('th');
+    th.innerText = 'Order Value (₹)';
+    th.style.minWidth = '120px';
+    th.style.textAlign = 'right';
+    tr.appendChild(th);
+    log('Inserted Order Value header');
+  }
+
+  // Main row processor
+  function processRows(info) {
+    if (!info || !info.tbody) return;
+    const rows = Array.from(info.tbody.querySelectorAll('tr'));
+    rows.forEach((row, idx) => {
+      if (row.querySelectorAll('td').length === 0) return;
+      const tds = Array.from(row.querySelectorAll('td'));
+      // attempt best guesses for each column
+      const qtyTd = (info.qtyIndex>=0 && tds[info.qtyIndex]) ? tds[info.qtyIndex] : tds.find(td => /qty|quantity/i.test(td.innerText || td.getAttribute('aria-label') || ''));
+      const ltpTd = (info.ltpIndex>=0 && tds[info.ltpIndex]) ? tds[info.ltpIndex] : tds.find(td => /ltp|last|price/i.test(td.innerText || td.getAttribute('aria-label') || ''));
+      const productTd = (info.productIndex>=0 && tds[info.productIndex]) ? tds[info.productIndex] : tds.find(td => /mtf|cnc|nrml|mis|product/i.test(td.innerText || ''));
+
+      let qty = 0, ltp = 0, productText = '';
+      if (qtyTd) {
+        const qText = (qtyTd.innerText || qtyTd.textContent || '').replace(/,/g,'');
+        qty = parseFloat((qText.match(/-?\d+(\.\d+)?/) || [0])[0]) || 0;
+      }
+      if (ltpTd) {
+        const pText = (ltpTd.innerText || ltpTd.textContent || '').replace(/[₹,]/g,'');
+        ltp = parseFloat((pText.match(/-?\d+(\.\d+)?/) || [0])[0]) || 0;
+      }
+      if (productTd) productText = (productTd.innerText || productTd.textContent || '').trim();
+
+      const showForProduct = PRODUCTS_TO_SHOW.some(prod => productText.toLowerCase().includes(prod.toLowerCase()));
+      const value = (qty || 0) * (ltp || 0);
+
+      // ensure value cell exists as last cell
+      let valueTd = row.querySelector('.tm-order-value-td');
+      if (!valueTd) {
+        valueTd = document.createElement('td');
+        valueTd.className = 'tm-order-value-td';
+        valueTd.style.textAlign = 'right';
+        valueTd.style.fontWeight = '600';
+        row.appendChild(valueTd);
+      }
+
+      if (showForProduct && value>0) {
+        valueTd.innerText = formatINR(value);
+        valueTd.title = `Qty ${qty} × LTP ${ltp} = ${value}`;
+        if (value > LIMIT) {
+          // highlight row
+          row.setAttribute('data-tm-highlighted', '1');
+          // preserve previous styles: append highlight
+          const prev = row.getAttribute('data-tm-prev-style') || row.getAttribute('style') || '';
+          if (!row.getAttribute('data-tm-prev-style')) row.setAttribute('data-tm-prev-style', prev);
+          row.style.cssText += ';' + HIGHLIGHT_STYLE;
+          valueTd.style.color = CELL_TEXT_COLOR;
+        } else {
+          if (row.getAttribute('data-tm-highlighted')) {
+            row.removeAttribute('data-tm-highlighted');
+            // restore previous inline style if we saved it
+            const prev = row.getAttribute('data-tm-prev-style') || '';
+            row.setAttribute('style', prev);
+            row.removeAttribute('data-tm-prev-style');
+            valueTd.style.color = '';
+          }
+        }
+      } else {
+        valueTd.innerText = '-';
+        valueTd.title = '';
+        if (row.getAttribute('data-tm-highlighted')) {
+          row.removeAttribute('data-tm-highlighted');
+          const prev = row.getAttribute('data-tm-prev-style') || '';
+          row.setAttribute('style', prev);
+          row.removeAttribute('data-tm-prev-style');
+        }
+      }
+    });
+    // log how many rows processed (once)
+    // (not too noisy)
+  }
+
+  // Top-level updater that waits for table and then runs periodically
+  let startedAt = Date.now();
+  let intervalHandle = null;
+  function startWatcher() {
+    if (intervalHandle) return;
+    intervalHandle = setInterval(() => {
+      const info = findPositionsTable();
+      if (info) {
+        ensureHeader(info);
+        processRows(info);
+      } else {
+        // If exceeded wait time, log and keep trying but less frequently
+        const waited = Date.now() - startedAt;
+        if (waited > MAX_WAIT_FOR_TABLE_MS) {
+          log('Still waiting for positions table... will keep trying in background');
+        } else {
+          log('Waiting for positions table to show up...');
+        }
+      }
+    }, REFRESH_INTERVAL_MS);
+    log('Watcher started');
+  }
+
+  // MutationObserver to react quicker to SPA updates
+  const observerRoot = document.querySelector('body') || document;
+  try {
+    const mo = new MutationObserver((mutations) => {
+      // small debounce to allow SPA content to settle
+      setTimeout(() => {
+        const info = findPositionsTable();
+        if (info) {
+          ensureHeader(info);
+          processRows(info);
+        }
+      }, 120);
+    });
+    mo.observe(observerRoot, { childList: true, subtree: true });
+    log('MutationObserver attached');
+  } catch (e) {
+    log('MutationObserver attach failed:', e);
+  }
+
+  // Start the periodic watcher
+  startWatcher();
+
+  // small UI badge to indicate script is active
+  function addBadge() {
+    if (document.querySelector('.tm-order-value-badge')) return;
+    const b = document.createElement('div');
+    b.className = 'tm-order-value-badge';
+    b.style.cssText = 'position:fixed; right:12px; bottom:60px; z-index:999999; background:#111; color:#fff; padding:8px 10px; border-radius:8px; font-size:13px; opacity:0.95;';
+    b.innerText = `TM: Order cap ₹${LIMIT.toLocaleString('en-IN')} (${PRODUCTS_TO_SHOW.join(',')})`;
+    document.body.appendChild(b);
+  }
+  setTimeout(addBadge, 1400);
+
+})();
