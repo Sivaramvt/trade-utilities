@@ -1,0 +1,275 @@
+{
+  "name": "Vol Regime Data → Google Sheets (v1.119.1)",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+        "options": {
+          "followRedirect": true,
+          "timeout": 60000
+        },
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Referer",
+              "value": "https://www.nseindia.com/option-chain"
+            }
+          ]
+        }
+      },
+      "name": "Fetch Option Chain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        -272,
+        -272
+      ],
+      "id": "82ae5272-312a-4bb2-8461-b0bbf8249679"
+    },
+    {
+      "parameters": {
+        "functionCode": "// === Compute IV + Prepare Row (Near = weekly, Far = monthly) ===\n\n// Extract option-chain JSON\nconst optionData = items[0]?.json;\nif (!optionData || !(optionData.records || optionData.data)) {\n  throw new Error(\"Invalid NSE Option Chain response\");\n}\n\nconst records = optionData.records || optionData;\nconst spot = Number(records.underlyingValue || 0);\nconst expiryDates = records.expiryDates || [];\nconst data = records.data || [];\n\nfunction round50(x) { return Math.round(x / 50) * 50; }\nconst atmStrike = round50(spot);\n\n// Group by expiry\nconst grouped = {};\nfor (const row of data) {\n  if (!grouped[row.expiryDate]) grouped[row.expiryDate] = [];\n  grouped[row.expiryDate].push(row);\n}\n\n// Find ATM IV for an expiry (only valid IVs)\nfunction getATMIV(expiry) {\n  const arr = grouped[expiry] || [];\n  if (!arr.length) return null;\n\n  // Find closest strike to ATM\n  let atm = arr.find(i => Number(i.strikePrice) === atmStrike);\n  if (!atm) {\n    atm = arr.reduce((a, b) =>\n      Math.abs(b.strikePrice - atmStrike) < Math.abs(a.strikePrice - atmStrike) ? b : a\n    );\n  }\n\n  const ceIV = atm?.CE?.impliedVolatility;\n  const peIV = atm?.PE?.impliedVolatility;\n\n  // Reject zeros & invalid IVs\n  const ce = ceIV > 0 ? Number(ceIV) : null;\n  const pe = peIV > 0 ? Number(peIV) : null;\n\n  if (ce && pe) return (ce + pe) / 2;\n  if (ce) return ce;\n  if (pe) return pe;\n  return null;\n}\n\n// -------------------------------\n// FIND NEAR_EXPIRY (closest weekly)\n// -------------------------------\nlet nearExpiry = null;\nfor (const exp of expiryDates) {\n  const iv = getATMIV(exp);\n  if (iv && iv > 0) {\n    nearExpiry = exp;\n    break;\n  }\n}\n\n// -------------------------------\n// FIND FAR_EXPIRY (nearest MONTHLY)\n// -------------------------------\n\n// Monthly expiries contain a date like 2025-11-27 (last Thursday of month)\nconst monthlyExpiries = expiryDates.filter(exp =>\n  /\\d{4}-\\d{2}-\\d{2}/.test(exp)\n);\n\n// If no monthly available (rare), fallback to second weekly\nlet farExpiry = null;\n\nif (monthlyExpiries.length > 0) {\n  // Pick the first monthly that has valid IV\n  for (const exp of monthlyExpiries) {\n    const iv = getATMIV(exp);\n    if (iv && iv > 0) {\n      farExpiry = exp;\n      break;\n    }\n  }\n}\n\n// If we still didn't pick far expiry, use the 2nd weekly expiry\nif (!farExpiry) {\n  const validWeeklies = expiryDates.filter(exp => getATMIV(exp) > 0);\n  if (validWeeklies.length >= 2) {\n    farExpiry = validWeeklies[1]; // second valid weekly\n  }\n}\n\n// Finally compute the IVs\nconst nearIV = nearExpiry ? getATMIV(nearExpiry) : null;\nconst farIV  = farExpiry  ? getATMIV(farExpiry)  : null;\n\n// Output row to append to Google Sheet\nreturn [{\n  json: {\n    Date: new Date().toISOString().split(\"T\")[0],\n    \"ATM_IV (%)\": nearIV,\n    \"Near_IV (%)\": nearIV,\n    \"Far_IV (%)\": farIV,\n    Nifty_Close: spot,\n    NearExpiry: nearExpiry,\n    FarExpiry: farExpiry\n  }\n}];\n"
+      },
+      "name": "Compute IV + Prepare Row",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        -272
+      ],
+      "id": "b20c763b-6540-44b7-bb9d-e4e031a4f66c"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1hDKNmrk46AFnr5rU6y7tIic9YbVmO1zNvQxoLDbULBA/",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "VolData",
+          "mode": "name"
+        },
+        "dataMode": "autoMapInputData",
+        "options": {}
+      },
+      "name": "Write to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 3,
+      "position": [
+        1072,
+        -272
+      ],
+      "id": "a6287dac-49de-450f-aa6c-e2ce0493d037",
+      "credentials": {
+        "googleApi": {
+          "id": "hEL2apt7sPj2zotp",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://www.nseindia.com/api/historicalOR/vixhistory?from=13-11-2025&to=14-11-2025",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Referer",
+              "value": "https://www.nseindia.com"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        400,
+        -208
+      ],
+      "id": "45906ab6-ce17-4330-8330-fd0ff4a0ba14",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: $json.Date = \"2025-11-14\"\n// Output: VIXDate = \"13-11-2025\"\n\n// Parse incoming ISO date (yyyy-mm-dd)\nconst iso = $json.Date; \nconst [y, m, d] = iso.split(\"-\");\n\n// Build Date object\nconst dt = new Date(Number(y), Number(m) - 1, Number(d));\n\n// Move to yesterday\ndt.setDate(dt.getDate() - 1);\n\n// Format dd-mm-yyyy for NSE VIX API\nconst dd = String(dt.getDate()).padStart(2, '0');\nconst mm = String(dt.getMonth() + 1).padStart(2, '0');\nconst yyyy = dt.getFullYear();\n\nconst vixDate = `${dd}-${mm}-${yyyy}`;\n\nreturn [{\n  json: {\n    Date: iso,\n    VIXDate: vixDate\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        176,
+        -208
+      ],
+      "id": "0778fbb8-1943-40eb-b39c-527329622b40",
+      "name": "Format date"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        848,
+        -272
+      ],
+      "id": "932923e7-ef69-441e-bb61-cd85f40c9cb4",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "const vix = Number(items[0].json?.data?.[0]?.EOD_CLOSE_INDEX_VAL ?? null);\nreturn [{ json: { India_VIX: vix } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        -208
+      ],
+      "id": "0947a137-de88-4446-a772-0fbb80d7b906",
+      "name": "Capture VIX"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 18 * * 1-5"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -448,
+        -416
+      ],
+      "id": "92d4bb1c-a62e-4929-9ace-ca8a5421516f",
+      "name": "Schedule Trigger",
+      "executeOnce": true
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Fetch Option Chain": {
+      "main": [
+        [
+          {
+            "node": "Compute IV + Prepare Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute IV + Prepare Row": {
+      "main": [
+        [
+          {
+            "node": "Format date",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Capture VIX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format date": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Write to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture VIX": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Option Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "5260c8ed-b9db-4de2-93f2-cdad2d3e7be9",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6e025367bad07569ce4d8f56b4c8e402b69d9c819f3568a7a36344c471292659"
+  },
+  "id": "ChSCAOS6liG8qMy8",
+  "tags": []
+}
