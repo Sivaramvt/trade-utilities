@@ -1,0 +1,1165 @@
+// ==UserScript==
+// @name         Zerodha Holdings Portfolio Guard
+// @namespace    https://kite.zerodha.com/
+// @version      0.2.0
+// @description  Adds portfolio-risk nudges, blacklist support, pledged-stock handling, and local alerting to Zerodha holdings.
+// @match        https://kite.zerodha.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  var STORAGE_KEY = "tiPortfolioGuardState";
+  var STYLE_ID = "ti-portfolio-guard-style";
+  var ROOT_ID = "ti-portfolio-guard-root";
+  var TOGGLE_ID = "ti-portfolio-guard-toggle";
+  var BANNER_ID = "ti-portfolio-guard-banner";
+  var HOLDINGS_PATH_RE = /^\/holdings\/equity(?:\/)?$/;
+  var SEVERITY_ORDER = { normal: 0, warn: 1, urgent: 2, exit_now: 3 };
+  var HEADER_ALIASES = {
+    symbol: ["instrument", "symbol", "stock", "tradingsymbol", "security", "name"],
+    quantity: ["qty", "quantity", "available qty", "available quantity"],
+    pledgedQuantity: ["pledged qty", "pledged quantity", "pledged"],
+    averagePrice: ["avg", "avg. price", "average", "average price"],
+    lastPrice: ["ltp", "last price", "price", "market price"],
+    pnlPercent: ["p&l %", "pnl %", "gain %", "return %", "returns %"],
+    pnlValue: ["p&l", "pnl", "gain/loss", "profit/loss", "unrealised p&l"],
+    dayChange: ["day change %", "change %", "day change"]
+  };
+  var CODE_BLACKLIST = ["BECTORFOOD","COLPAL","JINDRILL","NITIRAJ","CENTRALBK"]
+  var DEFAULTS = {
+    thresholds: {
+      warn: -3,
+      urgent: -4,
+      exit_now: -5
+    },
+    blacklist: CODE_BLACKLIST.slice(),
+    hideBlacklistedRows: false,
+    snoozes: {},
+    alerts: {},
+    notificationsEnabled: false,
+    collapsed: false,
+    panelPosition: {
+      top: 88,
+      right: 18,
+      left: null
+    }
+  };
+  var state = loadState();
+  var renderTimer = null;
+  var suppressRenderUntil = 0;
+  var lastRenderedView = {
+    type: "debug",
+    debug: {
+      route: window.location.pathname,
+      tables: 0,
+      matchedTables: 0
+    },
+    holdings: []
+  };
+  var dragState = {
+    active: false,
+    startX: 0,
+    startY: 0,
+    startTop: 88,
+    startLeft: 0
+  };
+
+  function cloneDefaults() {
+    return JSON.parse(JSON.stringify(DEFAULTS));
+  }
+
+  function loadState() {
+    var base = cloneDefaults();
+    try {
+      var raw = window.localStorage.getItem(STORAGE_KEY);
+      var parsed = raw ? JSON.parse(raw) : {};
+      if (!parsed || typeof parsed !== "object") {
+        parsed = {};
+      }
+      base.thresholds = mergeObjects(base.thresholds, parsed.thresholds || {});
+      base.blacklist = normalizeSymbolList(CODE_BLACKLIST);
+      base.hideBlacklistedRows = Boolean(parsed.hideBlacklistedRows);
+      base.snoozes = parsed.snoozes && typeof parsed.snoozes === "object" ? parsed.snoozes : {};
+      base.alerts = parsed.alerts && typeof parsed.alerts === "object" ? parsed.alerts : {};
+      base.notificationsEnabled = Boolean(parsed.notificationsEnabled);
+      base.collapsed = Boolean(parsed.collapsed);
+      if (parsed.panelPosition && typeof parsed.panelPosition === "object") {
+        base.panelPosition = mergeObjects(base.panelPosition, parsed.panelPosition);
+      }
+    } catch (error) {
+      console.warn("Portfolio guard: failed to load state", error);
+    }
+    return base;
+  }
+
+  function mergeObjects(left, right) {
+    var out = {};
+    var key;
+    for (key in left) {
+      if (Object.prototype.hasOwnProperty.call(left, key)) {
+        out[key] = left[key];
+      }
+    }
+    for (key in right) {
+      if (Object.prototype.hasOwnProperty.call(right, key)) {
+        out[key] = right[key];
+      }
+    }
+    return out;
+  }
+
+  function saveState() {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        thresholds: state.thresholds,
+        hideBlacklistedRows: state.hideBlacklistedRows,
+        snoozes: state.snoozes,
+        alerts: state.alerts,
+        notificationsEnabled: state.notificationsEnabled,
+        collapsed: state.collapsed,
+        panelPosition: state.panelPosition
+      }));
+    } catch (error) {
+      console.warn("Portfolio guard: failed to save state", error);
+    }
+  }
+
+  function suppressRenders(ms) {
+    suppressRenderUntil = Date.now() + ms;
+  }
+
+  function normalizeLabel(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\w% ]+/g, "")
+      .trim();
+  }
+
+  function normalizeSymbol(value) {
+    return String(value || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9_-]/g, "")
+      .trim();
+  }
+
+  function normalizeSymbolList(items) {
+    var seen = {};
+    var out = [];
+    var i;
+    for (i = 0; i < items.length; i += 1) {
+      var symbol = normalizeSymbol(items[i]);
+      if (symbol && !seen[symbol]) {
+        seen[symbol] = true;
+        out.push(symbol);
+      }
+    }
+    return out;
+  }
+
+  function parseNumber(value) {
+    if (typeof value === "number") {
+      return isFinite(value) ? value : null;
+    }
+    var text = String(value || "")
+      .replace(/₹|,|%/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) return null;
+    var match = text.match(/-?\d+(\.\d+)?/);
+    if (!match) return null;
+    var parsed = Number(match[0]);
+    return isFinite(parsed) ? parsed : null;
+  }
+
+  function formatPct(value) {
+    return Number(value || 0).toFixed(2) + "%";
+  }
+
+  function formatMoney(value) {
+    return "Rs " + Number(value || 0).toLocaleString("en-IN", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+  }
+
+  function isHoldingsRoute() {
+    return HOLDINGS_PATH_RE.test(window.location.pathname);
+  }
+
+  function ensureStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+    var style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = [
+      "#" + ROOT_ID + "{position:fixed;top:88px;right:18px;width:300px;max-height:calc(100vh - 110px);overflow:auto;z-index:99999;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:linear-gradient(180deg,#08111f 0%,#12233a 100%);color:#eaf2ff;border:1px solid rgba(120,159,255,.2);border-radius:16px;box-shadow:0 24px 60px rgba(3,10,24,.35);}",
+      "#" + ROOT_ID + " .ti-pg-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(120,159,255,.14);cursor:move;user-select:none;}",
+      "#" + ROOT_ID + " .ti-pg-title{font-size:14px;font-weight:700;letter-spacing:.02em;}",
+      "#" + ROOT_ID + " .ti-pg-subtitle{font-size:11px;color:#91a8d6;margin-top:2px;}",
+      "#" + ROOT_ID + " .ti-pg-body{padding:14px 16px 16px;}",
+      "#" + ROOT_ID + " .ti-pg-section + .ti-pg-section{margin-top:16px;}",
+      "#" + ROOT_ID + " .ti-pg-section-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#84a6ea;margin-bottom:8px;}",
+      "#" + ROOT_ID + " .ti-pg-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}",
+      "#" + ROOT_ID + " .ti-pg-stat{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:10px;}",
+      "#" + ROOT_ID + " .ti-pg-stat-label{font-size:11px;color:#93aad8;}",
+      "#" + ROOT_ID + " .ti-pg-stat-value{font-size:16px;font-weight:700;margin-top:4px;}",
+      "#" + ROOT_ID + " .ti-pg-list{display:flex;flex-direction:column;gap:8px;}",
+      "#" + ROOT_ID + " .ti-pg-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 12px;}",
+      "#" + ROOT_ID + " .ti-pg-card.warn{border-color:rgba(255,190,92,.45);background:rgba(255,190,92,.12);}",
+      "#" + ROOT_ID + " .ti-pg-card.urgent{border-color:rgba(255,128,83,.55);background:rgba(255,128,83,.12);}",
+      "#" + ROOT_ID + " .ti-pg-card.exit_now{border-color:rgba(255,95,122,.65);background:rgba(255,95,122,.16);}",
+      "#" + ROOT_ID + " .ti-pg-symbol{font-size:13px;font-weight:700;}",
+      "#" + ROOT_ID + " .ti-pg-meta{margin-top:4px;font-size:11px;color:#b8c9eb;line-height:1.5;}",
+      "#" + ROOT_ID + " .ti-pg-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}",
+      "#" + ROOT_ID + " button,#" + ROOT_ID + " input,#" + ROOT_ID + " textarea{font:inherit;}",
+      "#" + ROOT_ID + " .ti-pg-btn{border:0;border-radius:999px;padding:6px 10px;cursor:pointer;background:#1f4ed8;color:white;font-size:11px;}",
+      "#" + ROOT_ID + " .ti-pg-btn.secondary{background:rgba(255,255,255,.08);color:#dce7ff;}",
+      "#" + ROOT_ID + " .ti-pg-thresholds{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;}",
+      "#" + ROOT_ID + " .ti-pg-field label{display:block;font-size:10px;color:#93aad8;margin-bottom:4px;}",
+      "#" + ROOT_ID + " .ti-pg-field input,#" + ROOT_ID + " .ti-pg-textarea{width:100%;box-sizing:border-box;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(9,16,29,.88);color:#f6f9ff;padding:8px 10px;}",
+      "#" + ROOT_ID + " .ti-pg-textarea{min-height:58px;resize:vertical;}",
+      "#" + BANNER_ID + "{position:sticky;top:0;z-index:99998;margin:0 0 16px;padding:12px 16px;border-radius:14px;background:linear-gradient(135deg,rgba(255,108,107,.16),rgba(255,200,87,.16));color:#182031;border:1px solid rgba(255,129,129,.35);box-shadow:0 12px 24px rgba(255,135,135,.15);}",
+      "#" + BANNER_ID + ".exit_now{background:linear-gradient(135deg,rgba(255,84,104,.92),rgba(255,135,67,.92));color:white;}",
+      "#" + BANNER_ID + ".urgent{background:linear-gradient(135deg,rgba(255,148,87,.92),rgba(255,202,87,.92));color:#1d2535;}",
+      "#" + BANNER_ID + ".warn{background:linear-gradient(135deg,rgba(255,212,102,.95),rgba(255,240,176,.95));color:#2d2202;}",
+      "#" + BANNER_ID + " .ti-pg-banner-title{font-size:14px;font-weight:800;}",
+      "#" + BANNER_ID + " .ti-pg-banner-body{margin-top:6px;font-size:12px;line-height:1.45;}",
+      ".ti-pg-row.warn{background:rgba(255,214,102,.08)!important;}",
+      ".ti-pg-row.urgent{background:rgba(255,148,87,.1)!important;}",
+      ".ti-pg-row.exit_now{background:rgba(255,95,122,.12)!important;}",
+      ".ti-pg-row-ignored td.instrument,.ti-pg-row-ignored td.instrument a,.ti-pg-row-ignored td.instrument span{opacity:.72!important;}",
+      ".ti-pg-row-hidden{display:none!important;}",
+      ".ti-pg-badge{display:inline-flex;align-items:center;gap:4px;margin-left:8px;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;vertical-align:middle;}",
+      ".ti-pg-badge.warn{background:rgba(255,214,102,.15);color:#8a5600;}",
+      ".ti-pg-badge.urgent{background:rgba(255,148,87,.18);color:#8c3200;}",
+      ".ti-pg-badge.exit_now{background:rgba(255,95,122,.18);color:#a5183e;}",
+      ".ti-pg-note{display:block;margin-top:4px;font-size:10px;color:#6f7b95;}",
+      ".ti-pg-muted{color:#93aad8;font-size:11px;}",
+      ".ti-pg-pill{display:flex;align-items:center;gap:10px;}",
+      ".ti-pg-pill-count{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:26px;padding:0 8px;border-radius:999px;background:rgba(255,95,122,.16);color:#ffd7e0;font-size:12px;font-weight:700;}",
+      ".ti-pg-pill-meta{font-size:11px;color:#9db3dc;white-space:nowrap;}",
+      ".ti-pg-summary-line{font-size:11px;color:#9db3dc;margin-top:6px;}",
+      ".ti-pg-panel-note{font-size:11px;color:#9db3dc;line-height:1.5;}",
+      "#" + TOGGLE_ID + "{position:fixed;z-index:100000;display:none;align-items:center;gap:10px;padding:10px 14px;border:1px solid rgba(120,159,255,.2);border-radius:999px;background:#0d1a2d;color:#eaf2ff;box-shadow:0 18px 40px rgba(3,10,24,.32);cursor:pointer;font:600 12px ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}",
+      "#" + TOGGLE_ID + " .ti-pg-toggle-count{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;padding:0 7px;border-radius:999px;background:rgba(255,95,122,.16);color:#ffd7e0;font-size:12px;font-weight:700;}",
+      "#" + TOGGLE_ID + " .ti-pg-toggle-text{display:flex;flex-direction:column;gap:2px;}",
+      "#" + TOGGLE_ID + " .ti-pg-toggle-title{font-size:12px;font-weight:700;line-height:1.1;}",
+      "#" + TOGGLE_ID + " .ti-pg-toggle-meta{font-size:10px;color:#9db3dc;line-height:1.1;}"
+    ].join("");
+    document.head.appendChild(style);
+  }
+
+  function clearUi() {
+    var root = document.getElementById(ROOT_ID);
+    var toggle = document.getElementById(TOGGLE_ID);
+    var banner = document.getElementById(BANNER_ID);
+    var cells;
+    var rows;
+    var i;
+    if (root) root.remove();
+    if (toggle) toggle.remove();
+    if (banner) banner.remove();
+    rows = document.querySelectorAll(".ti-pg-row, .ti-pg-row-ignored, .ti-pg-row-hidden");
+    for (i = 0; i < rows.length; i += 1) {
+      rows[i].classList.remove("ti-pg-row", "ti-pg-row-ignored", "ti-pg-row-hidden", "warn", "urgent", "exit_now");
+    }
+    rows = document.querySelectorAll(".ti-pg-badge, .ti-pg-note");
+    for (i = 0; i < rows.length; i += 1) {
+      rows[i].remove();
+    }
+    cells = document.querySelectorAll("td.instrument, td.instrument a, td.instrument span");
+    for (i = 0; i < cells.length; i += 1) {
+      if (cells[i] && typeof cells[i].removeAttribute === "function") {
+        cells[i].removeAttribute("title");
+      }
+    }
+  }
+
+  function clearInjectedRowState() {
+    var rows;
+    var cells;
+    var badges;
+    var i;
+    rows = document.querySelectorAll(".ti-pg-row, .ti-pg-row-ignored, .ti-pg-row-hidden");
+    for (i = 0; i < rows.length; i += 1) {
+      rows[i].classList.remove("ti-pg-row", "ti-pg-row-ignored", "ti-pg-row-hidden", "warn", "urgent", "exit_now");
+    }
+    badges = document.querySelectorAll(".ti-pg-badge, .ti-pg-note");
+    for (i = 0; i < badges.length; i += 1) {
+      badges[i].remove();
+    }
+    cells = document.querySelectorAll("td.instrument");
+    for (i = 0; i < cells.length; i += 1) {
+      cells[i].removeAttribute("title");
+    }
+  }
+
+  function isOwnNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (node.id === ROOT_ID || node.id === TOGGLE_ID || node.id === BANNER_ID || node.id === STYLE_ID) return true;
+    if (typeof node.closest === "function") {
+      if (node.closest("#" + ROOT_ID)) return true;
+      if (node.closest("#" + TOGGLE_ID)) return true;
+      if (node.closest("#" + BANNER_ID)) return true;
+    }
+    return false;
+  }
+
+  function upsertRoot() {
+    var root = document.getElementById(ROOT_ID);
+    if (!root) {
+      root = document.createElement("aside");
+      root.id = ROOT_ID;
+      root.style.display = "block";
+      document.body.appendChild(root);
+    }
+    applyPanelPosition(root);
+    return root;
+  }
+
+  function upsertToggle() {
+    var toggle = document.getElementById(TOGGLE_ID);
+    if (!toggle) {
+      toggle = document.createElement("button");
+      toggle.id = TOGGLE_ID;
+      toggle.type = "button";
+      toggle.innerHTML =
+        '<span class="ti-pg-toggle-count">0</span>' +
+        '<span class="ti-pg-toggle-text">' +
+          '<span class="ti-pg-toggle-title">Portfolio Guard</span>' +
+          '<span class="ti-pg-toggle-meta">Open</span>' +
+        "</span>";
+      document.body.appendChild(toggle);
+    }
+    attachToggleEvents(toggle);
+    return toggle;
+  }
+
+  function applyPanelPosition(root) {
+    var position = state.panelPosition || {};
+    root.style.top = String(position.top != null ? position.top : 88) + "px";
+    if (position.left != null && position.left !== "") {
+      root.style.left = String(position.left) + "px";
+      root.style.right = "auto";
+    } else {
+      root.style.left = "auto";
+      root.style.right = String(position.right != null ? position.right : 18) + "px";
+    }
+  }
+
+  function startDrag(event, root) {
+    if (!root) return;
+    dragState.active = true;
+    dragState.startX = event.clientX;
+    dragState.startY = event.clientY;
+    dragState.startTop = state.panelPosition && state.panelPosition.top != null ? state.panelPosition.top : 88;
+    dragState.startLeft = root.getBoundingClientRect().left;
+    event.preventDefault();
+  }
+
+  function buildHeaderMap(headers) {
+    var map = {};
+    var i;
+    for (i = 0; i < headers.length; i += 1) {
+      var label = normalizeLabel(headers[i].textContent);
+      assignHeaderAlias(map, "symbol", label, i);
+      assignHeaderAlias(map, "quantity", label, i);
+      assignHeaderAlias(map, "pledgedQuantity", label, i);
+      assignHeaderAlias(map, "averagePrice", label, i);
+      assignHeaderAlias(map, "lastPrice", label, i);
+      assignHeaderAlias(map, "pnlPercent", label, i);
+      assignHeaderAlias(map, "pnlValue", label, i);
+      assignHeaderAlias(map, "dayChange", label, i);
+    }
+    return map;
+  }
+
+  function assignHeaderAlias(map, key, label, index) {
+    if (map[key] !== undefined) return;
+    if (HEADER_ALIASES[key].indexOf(label) >= 0) {
+      map[key] = index;
+    }
+  }
+
+  function extractCell(cells, index) {
+    if (index === undefined || index < 0 || index >= cells.length) return "";
+    return cells[index].textContent || "";
+  }
+
+  function parseHoldingRow(row, headerMap) {
+    var cells = row.children;
+    var symbol;
+    var quantityRaw;
+    var pledgedRaw;
+    var averagePrice;
+    var lastPrice;
+    var pnlPercentFromTable;
+    var pnlValue;
+    var dayChange;
+    var quantity;
+    var pledgedQuantity;
+    var monitoredQuantity;
+    var pnlPct;
+    var quantityCell;
+    var pledgedNode;
+    var pledgedFromNode;
+    var visibleQtyText;
+    var visibleQtyRaw;
+
+    if (!cells || !cells.length) return null;
+    symbol = normalizeSymbol(extractCell(cells, headerMap.symbol));
+    if (!symbol) return null;
+
+    quantityCell = headerMap.quantity !== undefined ? cells[headerMap.quantity] : null;
+    quantityRaw = parseNumber(extractCell(cells, headerMap.quantity));
+    pledgedRaw = parseNumber(extractCell(cells, headerMap.pledgedQuantity));
+    if (quantityCell) {
+      pledgedNode = quantityCell.querySelector(".q");
+      pledgedFromNode = parseNumber(pledgedNode ? pledgedNode.textContent : "");
+      if (pledgedFromNode != null) {
+        pledgedRaw = pledgedFromNode;
+      }
+      visibleQtyText = quantityCell.textContent || "";
+      if (pledgedNode) {
+        visibleQtyText = visibleQtyText.replace(pledgedNode.textContent || "", " ");
+      }
+      visibleQtyRaw = parseNumber(visibleQtyText);
+      if (visibleQtyRaw != null) {
+        quantityRaw = visibleQtyRaw;
+      }
+    }
+    averagePrice = parseNumber(extractCell(cells, headerMap.averagePrice));
+    lastPrice = parseNumber(extractCell(cells, headerMap.lastPrice));
+    pnlPercentFromTable = parseNumber(extractCell(cells, headerMap.pnlPercent));
+    pnlValue = parseNumber(extractCell(cells, headerMap.pnlValue));
+    dayChange = parseNumber(extractCell(cells, headerMap.dayChange));
+
+    quantity = quantityRaw && quantityRaw > 0 ? quantityRaw : 0;
+    pledgedQuantity = pledgedRaw && pledgedRaw > 0 ? pledgedRaw : 0;
+    monitoredQuantity = quantity > 0 ? quantity : pledgedQuantity;
+    if (monitoredQuantity <= 0) return null;
+    if (averagePrice == null || lastPrice == null || averagePrice <= 0) return null;
+
+    pnlPct = pnlPercentFromTable != null
+      ? pnlPercentFromTable
+      : ((lastPrice - averagePrice) / averagePrice) * 100;
+
+    return {
+      symbol: symbol,
+      row: row,
+      firstCell: cells[headerMap.symbol] || cells[0],
+      quantity: monitoredQuantity,
+      pledgedQuantity: pledgedQuantity,
+      averagePrice: averagePrice,
+      lastPrice: lastPrice,
+      pnlPct: pnlPct,
+      pnlValue: pnlValue != null ? pnlValue : (lastPrice - averagePrice) * monitoredQuantity,
+      dayChangePct: dayChange,
+      ignored: state.blacklist.indexOf(symbol) >= 0,
+      severity: "normal"
+    };
+  }
+
+  function readTableState() {
+    var specificTable = document.querySelector(".data-table.holdings-table table");
+    var tables = specificTable ? [specificTable] : document.querySelectorAll("table");
+    var i;
+    var debug = {
+      tables: tables.length,
+      matchedTables: 0,
+      route: window.location.pathname
+    };
+    for (i = 0; i < tables.length; i += 1) {
+      var table = tables[i];
+      var headers = table.querySelectorAll("thead th");
+      var headerMap;
+      var rows;
+      var holdings = [];
+      var j;
+      if (!headers.length) continue;
+      headerMap = buildHeaderMap(headers);
+      if (table.closest(".holdings-table")) {
+        headerMap.symbol = findHeaderIndexByClass(headers, "instrument");
+        headerMap.quantity = findHeaderIndexByClass(headers, "quantity");
+        headerMap.averagePrice = findHeaderIndexByClass(headers, "average-price");
+        headerMap.lastPrice = findHeaderIndexByClass(headers, "last-price");
+        headerMap.pnlValue = findHeaderIndexByClass(headers, "pnl");
+        headerMap.pnlPercent = findHeaderIndexByClass(headers, "net-change");
+        headerMap.dayChange = findHeaderIndexByClass(headers, "day-change");
+      }
+      if (headerMap.symbol === undefined || headerMap.averagePrice === undefined || headerMap.lastPrice === undefined) {
+        continue;
+      }
+      debug.matchedTables += 1;
+      rows = table.querySelectorAll("tbody tr");
+      for (j = 0; j < rows.length; j += 1) {
+        var parsed = parseHoldingRow(rows[j], headerMap);
+        if (parsed) holdings.push(parsed);
+      }
+      if (holdings.length) {
+        return { table: table, holdings: holdings, debug: debug };
+      }
+    }
+    return { table: null, holdings: [], debug: debug };
+  }
+
+  function findHeaderIndexByClass(headers, className) {
+    var i;
+    for (i = 0; i < headers.length; i += 1) {
+      if (headers[i].classList && headers[i].classList.contains(className)) {
+        return i;
+      }
+    }
+    return undefined;
+  }
+
+  function severityFor(pnlPct) {
+    if (pnlPct <= state.thresholds.exit_now) return "exit_now";
+    if (pnlPct <= state.thresholds.urgent) return "urgent";
+    if (pnlPct <= state.thresholds.warn) return "warn";
+    return "normal";
+  }
+
+  function isSnoozed(symbol) {
+    var until = state.snoozes[symbol];
+    if (!until) return false;
+    var dt = new Date(until);
+    if (isNaN(dt.getTime())) return false;
+    return dt.getTime() > Date.now();
+  }
+
+  function clearExpiredSnoozes() {
+    var changed = false;
+    var keys = Object.keys(state.snoozes);
+    var i;
+    for (i = 0; i < keys.length; i += 1) {
+      var symbol = keys[i];
+      var dt = new Date(state.snoozes[symbol]);
+      if (isNaN(dt.getTime()) || dt.getTime() <= Date.now()) {
+        delete state.snoozes[symbol];
+        changed = true;
+      }
+    }
+    if (changed) saveState();
+  }
+
+  function annotateRows(holdings) {
+    var i;
+    for (i = 0; i < holdings.length; i += 1) {
+      var holding = holdings[i];
+      var severity = (holding.ignored || isSnoozed(holding.symbol)) ? "normal" : severityFor(holding.pnlPct);
+      holding.severity = severity;
+      holding.row.classList.remove("ti-pg-row", "warn", "urgent", "exit_now");
+      holding.row.classList.toggle("ti-pg-row-ignored", Boolean(holding.ignored));
+      holding.row.classList.toggle("ti-pg-row-hidden", Boolean(holding.ignored && state.hideBlacklistedRows));
+      if (severity !== "normal") {
+        holding.row.classList.add("ti-pg-row", severity);
+      }
+      syncRowMarker(holding);
+    }
+  }
+
+  function syncRowMarker(holding) {
+    var titleParts = [];
+    var badges;
+    var i;
+    var badge;
+    if (!holding.firstCell) return;
+    badges = holding.firstCell.querySelectorAll(".ti-pg-badge");
+    for (i = 0; i < badges.length; i += 1) {
+      badges[i].remove();
+    }
+    if (holding.severity !== "normal") {
+      badge = document.createElement("span");
+      badge.className = "ti-pg-badge " + holding.severity;
+      badge.textContent = holding.severity.replace("_", " ");
+      holding.firstCell.appendChild(badge);
+    }
+    if (holding.ignored) titleParts.push("Ignored by blacklist");
+    if (holding.pledgedQuantity > 0) titleParts.push("Pledged qty: " + holding.pledgedQuantity);
+    if (isSnoozed(holding.symbol)) titleParts.push("Snoozed");
+    if (titleParts.length) {
+      holding.firstCell.title = titleParts.join(" | ");
+    } else {
+      holding.firstCell.removeAttribute("title");
+    }
+  }
+
+  function actionLabelFor(severity) {
+    if (severity === "warn") return "Reduce or reassess";
+    if (severity === "urgent") return "Urgent attention";
+    if (severity === "exit_now") return "Exit now. Read-only nudge.";
+    return "Normal";
+  }
+
+  function maybeNotify(breaches) {
+    var now = Date.now();
+    var i;
+    var active = {};
+    for (i = 0; i < breaches.length; i += 1) {
+      var holding = breaches[i];
+      var key = holding.symbol;
+      var level = holding.severity;
+      var previous = state.alerts[key];
+      active[key] = true;
+      if (holding.ignored || isSnoozed(key) || level === "normal") continue;
+      if (!previous || SEVERITY_ORDER[level] > SEVERITY_ORDER[previous.severity || "normal"] || now - (previous.at || 0) > 1800000) {
+        state.alerts[key] = { severity: level, at: now, pnlPct: holding.pnlPct };
+        if (state.notificationsEnabled && "Notification" in window && Notification.permission === "granted") {
+          var title = level === "exit_now" ? "Exit now: " + holding.symbol : "Portfolio guard: " + holding.symbol;
+          var body = formatPct(holding.pnlPct) + " | " + level.replace("_", " ") + " | no order placed";
+          new Notification(title, { body: body });
+        }
+      }
+    }
+    Object.keys(state.alerts).forEach(function (symbol) {
+      if (!active[symbol]) delete state.alerts[symbol];
+    });
+    saveState();
+  }
+
+  function upsertBanner(summary, breaches) {
+    var banner;
+    banner = document.getElementById(BANNER_ID);
+    if (banner) banner.remove();
+  }
+
+  function renderHoldingCard(holding) {
+    var rawSeverity = severityFor(holding.pnlPct);
+    var snoozed = isSnoozed(holding.symbol);
+    var actionText = snoozed ? "Snoozed" : actionLabelFor(rawSeverity);
+    return (
+      '<div class="ti-pg-card ' + rawSeverity + '" data-symbol-card="' + holding.symbol + '">' +
+        '<div class="ti-pg-symbol">' + holding.symbol + "</div>" +
+        '<div class="ti-pg-meta">' +
+          formatPct(holding.pnlPct) + " | qty " + holding.quantity +
+          (holding.pledgedQuantity > 0 ? " | pledged " + holding.pledgedQuantity : "") +
+          "<br>" +
+          "avg " + holding.averagePrice.toFixed(2) + " | last " + holding.lastPrice.toFixed(2) + " | " + actionText +
+        "</div>" +
+        '<div class="ti-pg-actions">' +
+          '<button class="ti-pg-btn secondary" data-action="snooze" data-symbol="' + holding.symbol + '">' + (snoozed ? "Unsnooze" : "Snooze 30m") + "</button>" +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  function renderPanel(holdings) {
+    var root = upsertRoot();
+    var toggle = upsertToggle();
+    var visible = [];
+    var breaches = [];
+    var i;
+    var summary;
+    var cardsHtml = "";
+
+    for (i = 0; i < holdings.length; i += 1) {
+      if (!holdings[i].ignored) visible.push(holdings[i]);
+      if (!holdings[i].ignored && severityFor(holdings[i].pnlPct) !== "normal") breaches.push(holdings[i]);
+    }
+    breaches.sort(function (a, b) { return a.pnlPct - b.pnlPct; });
+    summary = {
+      visibleCount: visible.length,
+      ignoredCount: holdings.length - visible.length,
+      flaggedCount: breaches.length,
+      totalValue: sumValue(visible, "value"),
+      totalPnl: sumValue(visible, "pnl")
+    };
+    for (i = 0; i < breaches.length; i += 1) {
+      cardsHtml += renderHoldingCard(breaches[i]);
+    }
+    if (!cardsHtml) {
+      cardsHtml = '<div class="ti-pg-card"><div class="ti-pg-muted">No active breaches right now.</div></div>';
+    }
+
+    root.innerHTML =
+      '<div class="ti-pg-header">' +
+        '<div class="ti-pg-pill">' +
+          '<span class="ti-pg-pill-count">' + summary.flaggedCount + '</span>' +
+          "<div>" +
+          '<div class="ti-pg-title">Portfolio Guard</div>' +
+          '<div class="ti-pg-summary-line">' + (summary.flaggedCount ? "Breach list" : "No breaches") + "</div>" +
+        "</div>" +
+        "</div>" +
+        '<button class="ti-pg-btn secondary" data-action="toggle-panel">Minimize</button>' +
+      "</div>" +
+      '<div class="ti-pg-body">' +
+        '<section class="ti-pg-section">' +
+          '<div class="ti-pg-actions">' +
+            '<button class="ti-pg-btn secondary" data-action="toggle-hide-blacklist">' + (state.hideBlacklistedRows ? "Show blacklisted rows" : "Hide blacklisted rows") + "</button>" +
+          "</div>" +
+        "</section>" +
+        '<section class="ti-pg-section">' +
+          '<div class="ti-pg-list">' + cardsHtml + "</div>" +
+        "</section>" +
+      "</div>";
+
+    attachPanelEvents(root);
+    updateToggle(summary);
+    applyVisibilityState(root, toggle);
+    upsertBanner(summary, breaches);
+    maybeNotify(breaches);
+  }
+
+  function renderDebugPanel(debug) {
+    var root = upsertRoot();
+    var toggle = upsertToggle();
+    root.innerHTML =
+      '<div class="ti-pg-header">' +
+        '<div class="ti-pg-pill">' +
+          '<span class="ti-pg-pill-count">?</span>' +
+          "<div>" +
+          '<div class="ti-pg-title">Portfolio Guard</div>' +
+          '<div class="ti-pg-subtitle">Script loaded, waiting for holdings table</div>' +
+        "</div>" +
+        "</div>" +
+        '<button class="ti-pg-btn secondary" data-action="toggle-panel">Minimize</button>' +
+      "</div>" +
+      '<div class="ti-pg-body">' +
+        '<section class="ti-pg-section">' +
+          '<div class="ti-pg-card">' +
+            '<div class="ti-pg-symbol">Debug status</div>' +
+            '<div class="ti-pg-meta">' +
+              'Route: ' + escapeHtml(debug.route || window.location.pathname) + '<br>' +
+              'Tables found: ' + Number(debug.tables || 0) + '<br>' +
+              'Candidate holdings tables: ' + Number(debug.matchedTables || 0) + '<br>' +
+              'If this stays here, Zerodha probably changed the holdings DOM and I need to tune the parser.' +
+            '</div>' +
+          '</div>' +
+        '</section>' +
+      '</div>';
+    attachPanelEvents(root);
+    updateToggle({ visibleCount: 0, flaggedCount: 0 });
+    applyVisibilityState(root, toggle);
+  }
+
+  function rerenderCurrentView() {
+    if (lastRenderedView.type === "holdings" && lastRenderedView.holdings && lastRenderedView.holdings.length) {
+      renderPanel(lastRenderedView.holdings);
+      return;
+    }
+    renderDebugPanel(lastRenderedView.debug || {
+      route: window.location.pathname,
+      tables: 0,
+      matchedTables: 0
+    });
+  }
+
+  function refreshCurrentHoldingsView() {
+    var holdings;
+    var i;
+    var severity;
+    if (!(lastRenderedView.type === "holdings" && lastRenderedView.holdings && lastRenderedView.holdings.length)) {
+      rerenderCurrentView();
+      return;
+    }
+    holdings = lastRenderedView.holdings;
+    for (i = 0; i < holdings.length; i += 1) {
+      holdings[i].ignored = state.blacklist.indexOf(holdings[i].symbol) >= 0;
+      severity = severityFor(holdings[i].pnlPct);
+      if (holdings[i].ignored || isSnoozed(holdings[i].symbol)) {
+        holdings[i].severity = "normal";
+      } else {
+        holdings[i].severity = severity;
+      }
+    }
+    annotateRows(holdings);
+    rerenderCurrentView();
+  }
+
+  function updateBreachCountUi(root, count) {
+    var countNodes;
+    var titleNode;
+    var i;
+    if (root) {
+      countNodes = root.querySelectorAll(".ti-pg-pill-count");
+      for (i = 0; i < countNodes.length; i += 1) {
+        countNodes[i].textContent = String(count);
+      }
+      titleNode = root.querySelector(".ti-pg-summary-line");
+      if (titleNode) {
+        titleNode.textContent = count ? "Breach list" : "No breaches";
+      }
+    }
+    updateToggle({
+      flaggedCount: count,
+      visibleCount: lastRenderedView.holdings ? lastRenderedView.holdings.length : 0
+    });
+  }
+
+  function toggleSnoozeWithoutPaneJump(symbol, actionNode) {
+    var holdings;
+    var i;
+    var card;
+    var metaNode;
+    var buttonNode;
+    var holding = null;
+    var snoozed;
+    var rawSeverity;
+    if (!(lastRenderedView.type === "holdings" && lastRenderedView.holdings && lastRenderedView.holdings.length)) {
+      refreshCurrentHoldingsView();
+      return;
+    }
+    holdings = lastRenderedView.holdings;
+    for (i = 0; i < holdings.length; i += 1) {
+      if (holdings[i].symbol === symbol) {
+        holding = holdings[i];
+        break;
+      }
+    }
+    if (!holding) {
+      refreshCurrentHoldingsView();
+      return;
+    }
+    rawSeverity = severityFor(holding.pnlPct);
+    holding.severity = isSnoozed(symbol) ? "normal" : rawSeverity;
+    annotateRows(holdings);
+    card = actionNode ? actionNode.closest(".ti-pg-card") : null;
+    if (card) {
+      snoozed = isSnoozed(symbol);
+      metaNode = card.querySelector(".ti-pg-meta");
+      buttonNode = card.querySelector('[data-action="snooze"]');
+      card.classList.remove("warn", "urgent", "exit_now");
+      card.classList.add(rawSeverity);
+      if (metaNode) {
+        metaNode.innerHTML =
+          formatPct(holding.pnlPct) + " | qty " + holding.quantity +
+          (holding.pledgedQuantity > 0 ? " | pledged " + holding.pledgedQuantity : "") +
+          "<br>" +
+          "avg " + holding.averagePrice.toFixed(2) + " | last " + holding.lastPrice.toFixed(2) + " | " +
+          (snoozed ? "Snoozed" : actionLabelFor(rawSeverity));
+      }
+      if (buttonNode) {
+        buttonNode.textContent = snoozed ? "Unsnooze" : "Snooze 30m";
+      }
+      return;
+    }
+    refreshCurrentHoldingsView();
+  }
+
+  function applyVisibilityState(root, toggle) {
+    var position = state.panelPosition || {};
+    if (!root) root = document.getElementById(ROOT_ID);
+    if (!toggle) toggle = document.getElementById(TOGGLE_ID);
+    if (root) {
+      root.style.display = state.collapsed ? "none" : "block";
+    }
+    if (toggle) {
+      toggle.style.display = state.collapsed ? "inline-flex" : "none";
+      toggle.style.top = String(position.top != null ? position.top : 88) + "px";
+      if (position.left != null && position.left !== "") {
+        toggle.style.left = String(position.left) + "px";
+        toggle.style.right = "auto";
+      } else {
+        toggle.style.left = "auto";
+        toggle.style.right = String(position.right != null ? position.right : 18) + "px";
+      }
+    }
+  }
+
+  function updateToggle(summary) {
+    var toggle = upsertToggle();
+    var countNode = toggle.querySelector(".ti-pg-toggle-count");
+    var metaNode = toggle.querySelector(".ti-pg-toggle-meta");
+    if (countNode) {
+      countNode.textContent = String(summary && summary.flaggedCount != null ? summary.flaggedCount : 0);
+    }
+    if (metaNode) {
+      metaNode.textContent = summary && summary.visibleCount != null
+        ? summary.visibleCount + " tracked"
+        : "Open";
+    }
+  }
+
+  function escapeHtml(text) {
+    return String(text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function sumValue(holdings, mode) {
+    var total = 0;
+    var i;
+    for (i = 0; i < holdings.length; i += 1) {
+      if (mode === "value") total += holdings[i].quantity * holdings[i].lastPrice;
+      if (mode === "pnl") total += holdings[i].pnlValue;
+    }
+    return total;
+  }
+
+  function attachPanelEvents(root) {
+    if (root.__tiPortfolioGuardEventsBound) return;
+    root.__tiPortfolioGuardEventsBound = true;
+
+    root.addEventListener("mousedown", function (event) {
+      var header = event.target.closest(".ti-pg-header");
+      if (!header) return;
+      if (event.target.closest("[data-action]")) return;
+      startDrag(event, root);
+    });
+
+    root.addEventListener("click", function (event) {
+      var actionNode = event.target.closest("[data-action]");
+      var action;
+      var symbol;
+      var until;
+      if (!actionNode || !root.contains(actionNode)) return;
+      action = actionNode.getAttribute("data-action");
+      if (!action) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (action === "toggle-panel") {
+        state.collapsed = true;
+        saveState();
+        applyVisibilityState(root);
+        return;
+      }
+
+      if (action === "toggle-notifications") {
+        function finishToggle() {
+          state.notificationsEnabled = Notification.permission === "granted" ? !state.notificationsEnabled : false;
+          saveState();
+          suppressRenders(1000);
+          rerenderCurrentView();
+        }
+        if (!("Notification" in window)) {
+          window.alert("Browser notifications are not supported here.");
+          return;
+        }
+        if (Notification.permission === "default") {
+          Notification.requestPermission().then(finishToggle);
+          return;
+        }
+        finishToggle();
+        return;
+      }
+
+      if (action === "snooze") {
+        symbol = normalizeSymbol(actionNode.getAttribute("data-symbol"));
+        if (!symbol) return;
+        if (isSnoozed(symbol)) {
+          delete state.snoozes[symbol];
+        } else {
+          until = new Date(Date.now() + 30 * 60 * 1000);
+          state.snoozes[symbol] = until.toISOString();
+        }
+        saveState();
+        suppressRenders(1000);
+        toggleSnoozeWithoutPaneJump(symbol, actionNode);
+        return;
+      }
+
+      if (action === "toggle-hide-blacklist") {
+        state.hideBlacklistedRows = !state.hideBlacklistedRows;
+        saveState();
+        suppressRenders(300);
+        refreshCurrentHoldingsView();
+        return;
+      }
+
+    });
+  }
+
+  function attachToggleEvents(toggle) {
+    if (toggle.__tiPortfolioGuardEventsBound) return;
+    toggle.__tiPortfolioGuardEventsBound = true;
+    toggle.__tiDragState = null;
+
+    toggle.addEventListener("pointerdown", function (event) {
+      toggle.__tiDragState = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        moved: false,
+        startTop: state.panelPosition && state.panelPosition.top != null ? state.panelPosition.top : 88,
+        startLeft: state.panelPosition && state.panelPosition.left != null ? state.panelPosition.left : null,
+        startRight: state.panelPosition && state.panelPosition.right != null ? state.panelPosition.right : 18
+      };
+      if (typeof toggle.setPointerCapture === "function") {
+        toggle.setPointerCapture(event.pointerId);
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    });
+
+    toggle.addEventListener("pointermove", function (event) {
+      var drag = toggle.__tiDragState;
+      var nextLeft;
+      var nextTop;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (Math.abs(event.clientX - drag.startX) > 4 || Math.abs(event.clientY - drag.startY) > 4) {
+        drag.moved = true;
+      }
+      if (!drag.moved) return;
+      nextTop = drag.startTop + (event.clientY - drag.startY);
+      if (drag.startLeft != null) {
+        nextLeft = drag.startLeft + (event.clientX - drag.startX);
+      } else {
+        nextLeft = toggle.getBoundingClientRect().left + (event.clientX - drag.startX);
+      }
+      state.panelPosition.left = Math.max(8, Math.round(nextLeft));
+      state.panelPosition.right = null;
+      state.panelPosition.top = Math.max(8, Math.round(nextTop));
+      applyVisibilityState();
+    });
+
+    toggle.addEventListener("pointerup", function (event) {
+      var drag = toggle.__tiDragState;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (typeof toggle.releasePointerCapture === "function") {
+        try {
+          toggle.releasePointerCapture(event.pointerId);
+        } catch (_) {}
+      }
+      toggle.__tiDragState = null;
+      event.preventDefault();
+      event.stopPropagation();
+      if (drag.moved) {
+        saveState();
+        return;
+      }
+      state.collapsed = false;
+      saveState();
+      applyVisibilityState();
+    });
+
+    toggle.addEventListener("pointercancel", function (event) {
+      var drag = toggle.__tiDragState;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      toggle.__tiDragState = null;
+    });
+  }
+
+  function render() {
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(function () {
+      if (Date.now() < suppressRenderUntil) {
+        return;
+      }
+      var snapshot;
+      var holdings;
+      var i;
+      if (!isHoldingsRoute()) {
+        clearUi();
+        return;
+      }
+      clearExpiredSnoozes();
+      clearInjectedRowState();
+      snapshot = readTableState();
+      if (!snapshot || !snapshot.holdings.length) {
+        lastRenderedView = {
+          type: "debug",
+          debug: snapshot && snapshot.debug ? snapshot.debug : { route: window.location.pathname, tables: 0, matchedTables: 0 },
+          holdings: []
+        };
+        renderDebugPanel(snapshot && snapshot.debug ? snapshot.debug : { route: window.location.pathname, tables: 0, matchedTables: 0 });
+        return;
+      }
+      holdings = [];
+      for (i = 0; i < snapshot.holdings.length; i += 1) {
+        var holding = snapshot.holdings[i];
+        holding.ignored = state.blacklist.indexOf(holding.symbol) >= 0;
+        holding.severity = "normal";
+        holdings.push(holding);
+      }
+      annotateRows(holdings);
+      for (i = 0; i < holdings.length; i += 1) {
+        if (holdings[i].ignored || isSnoozed(holdings[i].symbol)) {
+          holdings[i].severity = "normal";
+        }
+      }
+      lastRenderedView = {
+        type: "holdings",
+        debug: snapshot.debug || { route: window.location.pathname, tables: 0, matchedTables: 0 },
+        holdings: holdings
+      };
+      renderPanel(holdings);
+    }, 100);
+  }
+
+  function wireRouteHooks() {
+    var originalPushState = history.pushState;
+    var originalReplaceState = history.replaceState;
+
+    history.pushState = function () {
+      var result = originalPushState.apply(this, arguments);
+      window.dispatchEvent(new Event("ti-route-change"));
+      return result;
+    };
+
+    history.replaceState = function () {
+      var result = originalReplaceState.apply(this, arguments);
+      window.dispatchEvent(new Event("ti-route-change"));
+      return result;
+    };
+  }
+
+  ensureStyles();
+  upsertToggle();
+  wireRouteHooks();
+  render();
+
+  document.addEventListener("mousemove", function (event) {
+    var root;
+    var nextLeft;
+    var nextTop;
+    if (!dragState.active) return;
+    root = document.getElementById(ROOT_ID);
+    if (!root) return;
+    nextLeft = dragState.startLeft + (event.clientX - dragState.startX);
+    nextTop = dragState.startTop + (event.clientY - dragState.startY);
+    state.panelPosition.left = Math.max(8, Math.round(nextLeft));
+    state.panelPosition.right = null;
+    state.panelPosition.top = Math.max(8, Math.round(nextTop));
+    applyPanelPosition(root);
+  });
+
+  document.addEventListener("mouseup", function () {
+    if (!dragState.active) return;
+    dragState.active = false;
+    suppressRenders(250);
+    saveState();
+  });
+
+  new MutationObserver(function (mutations) {
+    var shouldRender = false;
+    var i;
+    var j;
+    for (i = 0; i < mutations.length; i += 1) {
+      var mutation = mutations[i];
+      if (!isOwnNode(mutation.target)) {
+        shouldRender = true;
+        break;
+      }
+      for (j = 0; j < mutation.addedNodes.length; j += 1) {
+        if (!isOwnNode(mutation.addedNodes[j])) {
+          shouldRender = true;
+          break;
+        }
+      }
+      if (shouldRender) break;
+      for (j = 0; j < mutation.removedNodes.length; j += 1) {
+        if (!isOwnNode(mutation.removedNodes[j])) {
+          shouldRender = true;
+          break;
+        }
+      }
+      if (shouldRender) break;
+    }
+    if (shouldRender && Date.now() >= suppressRenderUntil) {
+      render();
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
+  window.addEventListener("load", render);
+  window.addEventListener("focus", render);
+  window.addEventListener("popstate", render);
+  window.addEventListener("ti-route-change", render);
+  setInterval(render, 15000);
+})();
